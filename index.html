@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Rooftop Rush</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05081a; overflow: hidden; touch-action: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    /* keep the 400x640 canvas fully visible on any screen size */
+    max-width: 100vw; max-height: 100vh; aspect-ratio: 400 / 640;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    background: #0b1026;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="400" height="640"></canvas>
+<script>
+// ============================================================
+//  ROOFTOP RUSH - a vertical climber. Platforms fall; keep jumping.
+//  Everything lives in this one file. Art is optional: if a PNG
+//  is missing, the game draws a colored rectangle instead.
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+ctx.imageSmoothingEnabled = false;          // keep pixel art crisp when scaled
+
+// ---------- tuning knobs ----------
+const GRAVITY      = 1800;   // px/s^2
+const JUMP_V       = 700;    // px/s upward
+const MOVE_SPEED   = 230;    // px/s left/right
+const START_FALL   = 55;     // px/s platforms fall at the start
+const FALL_RAMP    = 3.5;    // px/s added per second
+const MAX_FALL     = 330;    // cap on fall speed
+const PX_PER_METER = 10;     // scroll pixels -> meters shown on HUD
+const WIN_METERS   = 1000;
+const CAMERA_LINE  = 220;    // if the player goes above this, push the world down
+const ZIP_RANGE    = 260;    // how far up a web-zip can reach
+const WEB_CHANCE   = 0.25;   // chance a new platform carries a web
+
+// ---------- assets (optional) ----------
+// Each entry tries to load a PNG; if it fails, drawing code falls back to a rectangle.
+const assets = {};
+['player_idle', 'player_jump', 'platform', 'web', 'background', 'logo'].forEach(name => {
+  const img = new Image();
+  img.src = name + '.png';
+  assets[name] = img;
+});
+const ready = img => img && img.complete && img.naturalWidth > 0;
+
+// ---------- game state ----------
+let phase;        // 'title' | 'playing' | 'won' | 'dead'
+let player;       // { x, y, w, h, vx, vy, onGround, facing }
+let platforms;    // [{ x, y, w, h, web }]
+let fallSpeed;    // current platform fall speed (px/s)
+let scrollPx;     // total pixels the world has scrolled past the player
+let webs;         // webs held
+let zipLine;      // { x1,y1,x2,y2, t } drawn briefly after a zip
+let elapsed;      // seconds in current run
+
+function reset() {
+  player = { x: W / 2 - 13, y: H - 180 - 36, w: 26, h: 36, vx: 0, vy: 0, onGround: false, facing: 1 };
+  platforms = [{ x: W / 2 - 60, y: H - 180, w: 120, h: 18, web: false }]; // starting ledge
+  fallSpeed = START_FALL;
+  scrollPx = 0;
+  webs = 0;
+  zipLine = null;
+  elapsed = 0;
+  while (topmost().y > -40) spawnPlatform();   // fill the screen upward
+}
+
+function topmost() {
+  return platforms.reduce((a, b) => (b.y < a.y ? b : a));
+}
+
+// New platforms appear above the highest one, within jumping reach sideways.
+function spawnPlatform() {
+  const top = topmost();
+  const gap = 80 + Math.random() * 30;              // vertical spacing (jump reaches ~135px)
+  const w = 64 + Math.random() * 50;
+  const centerPrev = top.x + top.w / 2;
+  let cx = centerPrev + (Math.random() * 2 - 1) * 190;
+  cx = Math.max(w / 2 + 8, Math.min(W - w / 2 - 8, cx));
+  platforms.push({ x: cx - w / 2, y: top.y - gap, w, h: 18, web: Math.random() < WEB_CHANCE });
+}
+
+// ---------- input ----------
+const keys = {};
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if ([' ', 'w', 'a', 's', 'd', 'arrowup', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+  if (!keys[k]) press(k);     // only fire once per physical press
+  keys[k] = true;
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// Actions that should happen once per press (not every frame the key is held).
+function press(k) {
+  if (phase !== 'playing') {
+    if (k === ' ' || k === 'w' || k === 'arrowup') { reset(); phase = 'playing'; }
+    return;
+  }
+  if ((k === 'w' || k === 'arrowup') && player.onGround) { player.vy = -JUMP_V; player.onGround = false; }
+  if (k === ' ') webZip();
+}
+
+// --- touch buttons (only shown on touch devices) ---
+const isTouch = matchMedia('(pointer: coarse)').matches;
+const buttons = [
+  { key: 'a', label: '<', x: 10,  y: H - 70, w: 70, h: 60 },
+  { key: 'd', label: '>', x: 90,  y: H - 70, w: 70, h: 60 },
+  { key: ' ', label: 'ZIP', x: W - 160, y: H - 70, w: 70, h: 60 },
+  { key: 'w', label: 'JUMP', x: W - 80, y: H - 70, w: 70, h: 60 },
+];
+const touches = {};   // touch id -> key
+function canvasPos(t) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (t.clientX - r.left) * W / r.width, y: (t.clientY - r.top) * H / r.height };
+}
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const p = canvasPos(t);
+    const b = buttons.find(b => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h);
+    if (phase !== 'playing' && !b) { press(' '); continue; }     // tap anywhere to start
+    if (b) { touches[t.identifier] = b.key; if (!keys[b.key]) press(b.key); keys[b.key] = true; }
+  }
+}, { passive: false });
+const endTouch = e => {
+  for (const t of e.changedTouches) {
+    const k = touches[t.identifier];
+    if (k) { keys[k] = false; delete touches[t.identifier]; }
+  }
+};
+canvas.addEventListener('touchend', endTouch);
+canvas.addEventListener('touchcancel', endTouch);
+canvas.addEventListener('mousedown', () => { if (phase !== 'playing' && !isTouch) press(' '); });
+
+// ---------- web-zip ----------
+// Find the nearest platform above the player that we are roughly underneath,
+// and snap onto it. Costs one web. Does nothing if there is no target.
+function webZip() {
+  if (webs <= 0) return;
+  const px = player.x + player.w / 2;
+  const feet = player.y + player.h;
+  let best = null;
+  for (const p of platforms) {
+    const above = feet - p.y;                     // positive if platform is above our feet
+    if (above <= 4 || above > ZIP_RANGE) continue;
+    if (px < p.x - 20 || px > p.x + p.w + 20) continue;   // must be roughly under it
+    if (!best || above < feet - best.y) best = p;
+  }
+  if (!best) return;
+  webs--;
+  zipLine = { x1: px, y1: player.y, x2: px, y2: best.y, t: 0.15 };
+  player.x = Math.max(best.x, Math.min(best.x + best.w - player.w, player.x));
+  player.y = best.y - player.h;
+  player.vy = 0;
+  player.onGround = true;
+}
+
+// ---------- update ----------
+function update(dt) {
+  elapsed += dt;
+  fallSpeed = Math.min(MAX_FALL, START_FALL + FALL_RAMP * elapsed);
+  const drop = fallSpeed * dt;
+
+  // 1. the whole world falls
+  for (const p of platforms) p.y += drop;
+  if (player.onGround) player.y += drop;          // ride the platform you stand on
+  scrollPx += drop;
+
+  // 2. horizontal input
+  player.vx = 0;
+  if (keys['a'] || keys['arrowleft'])  { player.vx = -MOVE_SPEED; player.facing = -1; }
+  if (keys['d'] || keys['arrowright']) { player.vx =  MOVE_SPEED; player.facing =  1; }
+  player.x += player.vx * dt;
+  player.x = Math.max(0, Math.min(W - player.w, player.x));   // screen edges are walls
+
+  // 3. gravity
+  const prevBottom = player.y + player.h;
+  player.vy += GRAVITY * dt;
+  player.y += player.vy * dt;
+  const newBottom = player.y + player.h;
+
+  // 4. one-way platform collision: only land when falling onto the top edge
+  player.onGround = false;
+  if (player.vy >= 0) {
+    for (const p of platforms) {
+      const overlapX = player.x + player.w > p.x && player.x < p.x + p.w;
+      if (overlapX && prevBottom <= p.y + 1 && newBottom >= p.y) {
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+        break;
+      }
+    }
+  }
+
+  // 5. camera: if the player climbs high, push everything down and count it as progress
+  if (player.y < CAMERA_LINE) {
+    const push = CAMERA_LINE - player.y;
+    player.y = CAMERA_LINE;
+    for (const p of platforms) p.y += push;
+    scrollPx += push;
+  }
+
+  // 6. collect webs (web sits on top of its platform)
+  for (const p of platforms) {
+    if (!p.web) continue;
+    const wx = p.x + p.w / 2 - 8, wy = p.y - 20;
+    if (player.x < wx + 16 && player.x + player.w > wx && player.y < wy + 16 && player.y + player.h > wy) {
+      p.web = false; webs++;
+    }
+  }
+
+  // 7. recycle platforms that fell off the bottom, spawn new ones at the top
+  platforms = platforms.filter(p => p.y < H + 20);
+  while (topmost().y > -40) spawnPlatform();
+
+  if (zipLine) { zipLine.t -= dt; if (zipLine.t <= 0) zipLine = null; }
+
+  // 8. win / lose
+  if (meters() >= WIN_METERS) phase = 'won';
+  if (player.y > H) phase = 'dead';
+}
+const meters = () => Math.floor(scrollPx / PX_PER_METER);
+
+// ---------- draw ----------
+function draw() {
+  // background
+  if (ready(assets.background)) ctx.drawImage(assets.background, 0, 0, W, H);
+  else { ctx.fillStyle = '#0b1026'; ctx.fillRect(0, 0, W, H); }
+
+  // platforms
+  for (const p of platforms) {
+    if (ready(assets.platform)) {
+      // take a slice of the brick tile with the same shape as this platform
+      const img = assets.platform;
+      const srcW = Math.min(img.width, img.height * p.w / p.h);
+      ctx.drawImage(img, 0, 0, srcW, img.height, p.x, p.y, p.w, p.h);
+    } else {
+      ctx.fillStyle = '#555c6e'; ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = '#9aa3b8'; ctx.fillRect(p.x, p.y, p.w, 3);
+    }
+    if (p.web) {
+      const wx = p.x + p.w / 2 - 8, wy = p.y - 20;
+      if (ready(assets.web)) ctx.drawImage(assets.web, wx - 2, wy - 2, 20, 20);
+      else { ctx.fillStyle = '#e8f4ff'; ctx.fillRect(wx + 3, wy + 3, 10, 10); }
+    }
+  }
+
+  // zip line
+  if (zipLine) {
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(zipLine.x1, zipLine.y1); ctx.lineTo(zipLine.x2, zipLine.y2); ctx.stroke();
+  }
+
+  // player (flipped when facing left)
+  if (phase !== 'title') {
+    const img = player.onGround ? assets.player_idle : assets.player_jump;
+    ctx.save();
+    ctx.translate(player.x + player.w / 2, player.y);
+    ctx.scale(player.facing, 1);
+    if (ready(img)) {
+      const dw = player.h * img.width / img.height;   // keep the sprite's proportions
+      ctx.drawImage(img, -dw / 2, 0, dw, player.h);
+    }
+    else {
+      ctx.fillStyle = '#d6322d'; ctx.fillRect(-player.w / 2, 0, player.w, player.h * 0.6);   // red hoodie
+      ctx.fillStyle = '#2d4bd6'; ctx.fillRect(-player.w / 2, player.h * 0.6, player.w, player.h * 0.4); // blue jeans
+    }
+    ctx.restore();
+  }
+
+  // HUD
+  if (phase === 'playing') {
+    ctx.fillStyle = 'rgba(5,8,26,0.6)'; ctx.fillRect(0, 0, W, 36);   // dark strip so text reads over platforms
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 18px monospace'; ctx.textAlign = 'left';
+    ctx.fillText(meters() + ' m', 10, 26);
+    ctx.textAlign = 'right';
+    ctx.fillText('WEBS: ' + webs, W - 10, 26);
+  }
+  if (isTouch && phase === 'playing') {
+    for (const b of buttons) {
+      ctx.fillStyle = keys[b.key] ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.18)';
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 6);
+    }
+  }
+
+  // screens
+  if (phase !== 'playing') {
+    ctx.fillStyle = 'rgba(5,8,26,0.78)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+    const startHint = isTouch ? 'TAP TO START' : 'PRESS SPACE TO START';
+    if (phase === 'title') {
+      if (ready(assets.logo)) {
+        const lw = 320, lh = lw * assets.logo.height / assets.logo.width;
+        ctx.drawImage(assets.logo, (W - lw) / 2, 90, lw, lh);
+      } else { ctx.font = 'bold 44px monospace'; ctx.fillText('ROOFTOP RUSH', W / 2, 150); }
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText('Climb to ' + WIN_METERS + ' m to win.', W / 2, 260);
+      ctx.font = '16px monospace';
+      ctx.fillText('The rooftops are falling.', W / 2, 290);
+      ctx.fillText("Don't ride one off the bottom!", W / 2, 312);
+      if (isTouch) {
+        ctx.fillText('< >  move      JUMP  jump', W / 2, 370);
+        ctx.fillText('ZIP  web-zip up (needs a web)', W / 2, 394);
+      } else {
+        ctx.fillText('A / D   move left & right', W / 2, 370);
+        ctx.fillText('W       jump', W / 2, 394);
+        ctx.fillText('SPACE   web-zip to the platform above', W / 2, 418);
+        ctx.fillText('(grab white webs to use it)', W / 2, 442);
+      }
+      ctx.font = 'bold 20px monospace'; ctx.fillText(startHint, W / 2, 520);
+    } else {
+      ctx.font = 'bold 40px monospace';
+      ctx.fillText(phase === 'won' ? 'YOU WIN!' : 'GAME OVER', W / 2, 250);
+      ctx.font = 'bold 22px monospace';
+      ctx.fillText(phase === 'won' ? 'You made it to the top.' : 'You climbed ' + meters() + ' m', W / 2, 310);
+      ctx.font = 'bold 20px monospace';
+      ctx.fillText(isTouch ? 'TAP TO PLAY AGAIN' : 'PRESS SPACE TO PLAY AGAIN', W / 2, 400);
+    }
+  }
+}
+
+// ---------- game loop ----------
+// requestAnimationFrame calls this ~60 times a second. dt is real elapsed time,
+// so the game runs at the same speed on a 60Hz laptop and a 120Hz phone.
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);   // cap dt so a tab-switch doesn't teleport you
+  last = now;
+  if (phase === 'playing') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+reset();
+phase = 'title';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
